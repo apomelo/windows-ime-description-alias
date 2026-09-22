@@ -91,6 +91,28 @@ Q        退出
 .\Set-ChineseImeAlias.ps1 -Mode Current -DryRun
 ```
 
+## 不依赖脚本的一句话命令
+
+以下命令可直接粘贴到**管理员 PowerShell** 中运行，不依赖本仓库脚本或网络。它们会立即把 `Description` 修改为 `搜狗拼音输入法`，不进行确认，也不会创建备份。
+
+### 自动修改当前激活的中文输入法
+
+执行前，先在当前 PowerShell 窗口中切换到目标中文 TSF 输入法。该命令支持简体和繁体中文输入法，并修改实际存在的 32 位和 64 位注册表视图：
+
+```powershell
+if(-not('ImeOneLine.T' -as [type])){Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;namespace ImeOneLine{[StructLayout(LayoutKind.Sequential)]public struct P{public uint t;public ushort l;public Guid c;public Guid p;public Guid k;public IntPtr s;public uint a;public IntPtr h;public uint f;}[ComImport,Guid("71C6E74C-0F28-11D8-A82A-00065B84435C"),InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]interface I{[PreserveSig]int A();[PreserveSig]int B();[PreserveSig]int C();[PreserveSig]int D();[PreserveSig]int E();[PreserveSig]int F();[PreserveSig]int G();[PreserveSig]int H(ref Guid g,out P p);}public static class T{public static P Get(){object o=Activator.CreateInstance(Type.GetTypeFromCLSID(new Guid("33C53A50-F456-4884-B049-85FD643ECFED")));try{Guid g=new Guid("34745C63-B2F0-4784-8B67-5E12C8701A31");P p;int h=((I)o).H(ref g,out p);if(h!=0)throw new COMException("GetActiveProfile failed",h);return p;}finally{Marshal.FinalReleaseComObject(o);}}}}'};$p=[ImeOneLine.T]::Get();if($p.t-ne 1-or($p.l-band 0x3ff)-ne 4){throw '当前激活的不是中文 TSF 输入法'};$path='SOFTWARE\Microsoft\CTF\TIP\{0}\LanguageProfile\0x{1:X8}\{2}'-f $p.c.ToString('B'),[uint32]$p.l,$p.p.ToString('B');$views=@([Microsoft.Win32.RegistryView]::Registry32);if([Environment]::Is64BitOperatingSystem){$views=@([Microsoft.Win32.RegistryView]::Registry64,[Microsoft.Win32.RegistryView]::Registry32)};$n=0;foreach($v in $views){$b=[Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine,$v);try{$k=$b.OpenSubKey($path,$true);if($k){try{$k.SetValue('Description','搜狗拼音输入法',[Microsoft.Win32.RegistryValueKind]::String);$n++}finally{$k.Dispose()}}}finally{$b.Dispose()}};if(!$n){throw '没有找到对应的输入法注册表项'};Write-Host "修改完成，共写入 $n 个注册表视图" -ForegroundColor Green
+```
+
+### 固定修改小狼毫简体中文 Profile
+
+该命令不检查当前输入法，直接修改小狼毫的简体中文（`0x0804`）Profile：
+
+```powershell
+$p='SOFTWARE\Microsoft\CTF\TIP\{A3F4CDED-B1E9-41EE-9CA6-7B4D0DE6CB0A}\LanguageProfile\0x00000804\{3D02CAB6-2B8E-4781-BA20-1C9267529467}';$vs=if([Environment]::Is64BitOperatingSystem){@([Microsoft.Win32.RegistryView]::Registry64,[Microsoft.Win32.RegistryView]::Registry32)}else{@([Microsoft.Win32.RegistryView]::Registry32)};$n=0;foreach($v in $vs){$b=[Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine,$v);try{$k=$b.OpenSubKey($p,$true);if($k){try{$k.SetValue('Description','搜狗拼音输入法',[Microsoft.Win32.RegistryValueKind]::String);$n++}finally{$k.Dispose()}}}finally{$b.Dispose()}};Write-Host "修改完成，共写入 $n 个注册表视图" -ForegroundColor Green
+```
+
+上述小狼毫命令使用官方安装版本的固定 TSF 标识。第三方修改版如果更换了 CLSID 或 Profile GUID，则不适用。
+
 ## 修改范围
 
 脚本根据 TSF Profile 的以下标识定位注册表项：
