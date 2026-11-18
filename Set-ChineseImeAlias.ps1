@@ -11,7 +11,16 @@ param(
     [string]$Selection,
 
     [switch]$NoConfirm,
-    [switch]$DryRun
+    [switch]$DryRun,
+
+    # 从备份 JSON 恢复注册表 Description 值（指定备份文件路径）
+    [string]$Restore,
+
+    # 交互式列出脚本目录 backup 文件夹中的备份，由用户选择要恢复的备份
+    [switch]$RestoreMenu,
+
+    # 仅切换当前控制台窗口字体为新宋体后退出（供 bat 启动器在显示菜单前调用）
+    [switch]$FixConsoleFontOnly
 )
 
 Set-StrictMode -Version 2.0
@@ -23,10 +32,87 @@ $script:DefaultAlias = -join @(
     [char]0x8F93, [char]0x5165, [char]0x6CD5
 )
 
+# 备份目录固定为脚本所在文件夹下的 backup
+$script:BackupDir = Join-Path $PSScriptRoot 'backup'
+
 function Test-IsAdministrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Use-CjkConsoleFont {
+    # 旧版控制台（conhost）的输出区域不做字体回退：字体不含中文字形时中文显示为 ?。
+    # 常见于系统区域为英文的机器（默认 Consolas）。这里把当前控制台窗口的字体
+    # 切换为系统自带的新宋体（NSimSun），仅影响当前窗口。Windows Terminal /
+    # VS Code 终端自带字体回退，无需处理。
+    if ($env:WT_SESSION -or $env:TERM_PROGRAM) {
+        return
+    }
+    if ('ImeAliasTool.ConsoleFont' -as [type]) {
+        return
+    }
+
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace ImeAliasTool
+{
+    public static class ConsoleFont
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        public struct COORD { public short X; public short Y; }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct CONSOLE_FONT_INFOEX
+        {
+            public uint cbSize;
+            public uint nFont;
+            public COORD dwFontSize;
+            public int FontFamily;
+            public int FontWeight;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+            public string FaceName;
+        }
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GetStdHandle(int nStdHandle);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        private static extern bool GetCurrentConsoleFontEx(
+            IntPtr hConsoleOutput, bool bMaximumWindow,
+            ref CONSOLE_FONT_INFOEX lpConsoleCurrentFontEx);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        private static extern bool SetCurrentConsoleFontEx(
+            IntPtr hConsoleOutput, bool bMaximumWindow,
+            ref CONSOLE_FONT_INFOEX lpConsoleCurrentFontEx);
+
+        public static bool SetFace(string faceName)
+        {
+            IntPtr handle = GetStdHandle(-11); // STD_OUTPUT_HANDLE
+            if (handle == IntPtr.Zero) return false;
+
+            CONSOLE_FONT_INFOEX info = new CONSOLE_FONT_INFOEX();
+            info.cbSize = (uint)Marshal.SizeOf(typeof(CONSOLE_FONT_INFOEX));
+            if (!GetCurrentConsoleFontEx(handle, false, ref info)) return false;
+            if (string.Equals(info.FaceName, faceName,
+                StringComparison.OrdinalIgnoreCase)) return true;
+
+            info.FaceName = faceName;
+            return SetCurrentConsoleFontEx(handle, false, ref info);
+        }
+    }
+}
+'@
+
+    try {
+        [void][ImeAliasTool.ConsoleFont]::SetFace('NSimSun')
+    }
+    catch {
+        # 字体切换失败不影响脚本功能
+    }
 }
 
 function Initialize-TsfInterop {
@@ -476,40 +562,282 @@ function Restore-DescriptionValue([object]$Entry) {
     }
 }
 
-function Save-Backup([object[]]$Entries, [string]$NewAlias) {
-    $localAppData = [Environment]::GetFolderPath(
-        [Environment+SpecialFolder]::LocalApplicationData
-    )
-    $backupDirectory = Join-Path $localAppData 'ImeAliasTool\Backups'
-    [void](New-Item -ItemType Directory -Path $backupDirectory -Force)
+function Get-ProfileGuidHex([string]$Path) {
+    # 注册表条目路径的最后一段是 Profile GUID，去掉大括号和连字符得到 32 位十六进制串
+    $leaf = Split-Path $Path -Leaf
+    return ($leaf -replace '[{}\-]', '').ToUpperInvariant()
+}
 
-    $fileName = 'ime-description-{0}-{1}.json' -f `
-        (Get-Date -Format 'yyyyMMdd-HHmmss'), ([Guid]::NewGuid().ToString('N').Substring(0, 8))
-    $backupPath = Join-Path $backupDirectory $fileName
+function Get-BackupItems([string]$FilePath) {
+    try {
+        $backup = Get-Content -LiteralPath $FilePath -Raw -Encoding UTF8 | ConvertFrom-Json
+    }
+    catch {
+        return @()
+    }
+    return @($backup.items)
+}
 
-    $items = foreach ($entry in $Entries) {
-        [ordered]@{
-            view              = $entry.View
-            path              = $entry.Path
-            descriptionExists = [bool]$entry.DescriptionExists
-            description       = $entry.Description
-            descriptionKind   = $entry.DescriptionKind
+function Find-BackupsForPath([string]$Path) {
+    # 按备份内容（注册表路径）查找：同一输入法的既有备份文件
+    if (-not (Test-Path -LiteralPath $script:BackupDir -PathType Container)) {
+        return @()
+    }
+    $matches = New-Object System.Collections.Generic.List[object]
+    foreach ($file in (Get-ChildItem -LiteralPath $script:BackupDir -Filter 'ime-description-*.json' -File)) {
+        foreach ($item in (Get-BackupItems $file.FullName)) {
+            if ([string]$item.path -eq $Path) {
+                $matches.Add($file)
+                break
+            }
         }
     }
+    return $matches
+}
 
-    $backup = [ordered]@{
-        formatVersion = 1
-        createdAt     = (Get-Date).ToString('o')
-        computerName  = $env:COMPUTERNAME
-        newAlias      = $NewAlias
-        items         = @($items)
+function Update-BackupAlias([string]$FilePath, [string]$NewAlias) {
+    # 保留备份中的原始恢复值不变，仅把「当时改为」更新为最新的别名
+    $backup = Get-Content -LiteralPath $FilePath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $backup.newAlias = $NewAlias
+    $backup | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $FilePath -Encoding UTF8
+}
+
+function Get-UniqueBackupFileName([string]$Path) {
+    # 文件名使用 Profile GUID 前 8 位；若被其他输入法的备份撞名（GUID 前缀冲突），
+    # 逐步加长 GUID 片段直到唯一，不覆盖其他输入法的备份
+    $guidHex = Get-ProfileGuidHex $Path
+    foreach ($length in 8, 12, 16, 20, 24, 28, 32) {
+        if ($length -gt $guidHex.Length) {
+            break
+        }
+        $fileName = 'ime-description-{0}.json' -f $guidHex.Substring(0, $length)
+        $fullPath = Join-Path $script:BackupDir $fileName
+        if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) {
+            return $fileName
+        }
+        # 同名文件内容属于当前条目时不算冲突（调用方已按内容跳过，这里只是兜底）
+        $samePath = $false
+        foreach ($item in (Get-BackupItems $fullPath)) {
+            if ([string]$item.path -eq $Path) {
+                $samePath = $true
+                break
+            }
+        }
+        if ($samePath) {
+            return $fileName
+        }
+    }
+    # 极端情况：完整 GUID 仍冲突，追加随机后缀保底
+    return 'ime-description-{0}-{1}.json' -f `
+        $guidHex, ([Guid]::NewGuid().ToString('N').Substring(0, 8))
+}
+
+function Save-Backup([object[]]$Entries, [string]$NewAlias) {
+    # 同一输入法只保留最早的一份备份：反复修改 A → B → C 时不再生成新备份，
+    # 恢复时始终回到最开始的原始值 A；但会把已有备份中的别名更新为最新值
+    [void](New-Item -ItemType Directory -Path $script:BackupDir -Force)
+
+    $backupPaths = New-Object System.Collections.Generic.List[string]
+    foreach ($group in ($Entries | Group-Object Path)) {
+        $profilePath = $group.Name
+        $existing = @(Find-BackupsForPath $profilePath)
+        if ($existing.Count -gt 0) {
+            foreach ($file in $existing) {
+                Update-BackupAlias -FilePath $file.FullName -NewAlias $NewAlias
+            }
+            Write-Host ('  该输入法的最早备份已存在，已将备份中的别名更新为最新值（恢复值不变）：HKLM\{0}' -f $profilePath)
+            continue
+        }
+
+        $backupPath = Join-Path $script:BackupDir (Get-UniqueBackupFileName $profilePath)
+        $items = foreach ($entry in $group.Group) {
+            [ordered]@{
+                view              = $entry.View
+                path              = $entry.Path
+                descriptionExists = [bool]$entry.DescriptionExists
+                description       = $entry.Description
+                descriptionKind   = $entry.DescriptionKind
+            }
+        }
+        $backup = [ordered]@{
+            formatVersion = 1
+            createdAt     = (Get-Date).ToString('o')
+            computerName  = $env:COMPUTERNAME
+            newAlias      = $NewAlias
+            items         = @($items)
+        }
+        $backup | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $backupPath -Encoding UTF8
+        $backupPaths.Add($backupPath)
+    }
+    return @($backupPaths)
+}
+
+function Get-LiveDescription([string]$View, [string]$Path) {
+    # 读取注册表中该条目当前的 Description 值（只读）
+    $baseKey = Get-RegistryBaseKey $View
+    try {
+        $key = $baseKey.OpenSubKey($Path, $false)
+        if ($null -eq $key) {
+            return [pscustomobject]@{ KeyExists = $false; Exists = $false; Value = $null }
+        }
+        try {
+            $names = @($key.GetValueNames())
+            if ($names -contains 'Description') {
+                return [pscustomobject]@{
+                    KeyExists = $true
+                    Exists    = $true
+                    Value     = [string]$key.GetValue('Description', $null,
+                        [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                }
+            }
+            return [pscustomobject]@{ KeyExists = $true; Exists = $false; Value = $null }
+        }
+        finally {
+            $key.Dispose()
+        }
+    }
+    finally {
+        $baseKey.Dispose()
+    }
+}
+
+function Select-BackupFromMenu {
+    if (-not (Test-Path -LiteralPath $script:BackupDir -PathType Container)) {
+        throw ('备份目录不存在：{0}' -f $script:BackupDir)
     }
 
-    $backup | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $backupPath -Encoding UTF8
-    return $backupPath
+    $files = @(Get-ChildItem -LiteralPath $script:BackupDir -Filter 'ime-description-*.json' -File |
+        Sort-Object Name -Descending)
+    if ($files.Count -eq 0) {
+        throw ('备份目录中没有可恢复的备份：{0}' -f $script:BackupDir)
+    }
+
+    $backups = New-Object System.Collections.Generic.List[object]
+    foreach ($file in $files) {
+        try {
+            $backup = Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+        }
+        catch {
+            Write-Host ('{0}（无法解析，已跳过）' -f $file.Name) -ForegroundColor DarkYellow
+            continue
+        }
+        $backups.Add([pscustomobject]@{ File = $file; Backup = $backup })
+    }
+    if ($backups.Count -eq 0) {
+        throw '备份目录中的文件都无法解析。'
+    }
+
+    Write-Host ''
+    Write-Host '可恢复的备份（新 → 旧）：' -ForegroundColor Cyan
+    for ($i = 0; $i -lt $backups.Count; $i++) {
+        $entry = $backups[$i]
+        $backup = $entry.Backup
+        Write-Host ('[{0}] {1}' -f ($i + 1), $entry.File.Name) -ForegroundColor Yellow
+        Write-Host ('    备份时间={0}  当时改为={1}' -f $backup.createdAt, $backup.newAlias)
+        foreach ($item in @($backup.items)) {
+            $live = Get-LiveDescription -View ([string]$item.view) -Path ([string]$item.path)
+            $currentText = if (-not $live.KeyExists) {
+                '（注册表项当前不存在）'
+            }
+            elseif (-not $live.Exists) {
+                '（当前无 Description 值）'
+            }
+            else {
+                $live.Value
+            }
+            $restoreText = if ([bool]$item.descriptionExists) {
+                [string]$item.description
+            }
+            else {
+                '（恢复时删除 Description）'
+            }
+            Write-Host ('    - HKLM\{0} ({1})' -f $item.path, $item.view)
+            Write-Host ('      {0}  →  {1}' -f $currentText, $restoreText)
+        }
+    }
+    Write-Host ''
+
+    $choice = (Read-Host '请输入要恢复的备份编号，Q=取消').Trim()
+    if ($choice -match '^(?i:q|quit)$') {
+        return $null
+    }
+    $number = 0
+    if (-not [int]::TryParse($choice, [ref]$number) -or `
+        $number -lt 1 -or $number -gt $backups.Count) {
+        throw ('无效的编号：{0}' -f $choice)
+    }
+    return $backups[$number - 1].File.FullName
 }
 
 try {
+    Use-CjkConsoleFont
+    if ($FixConsoleFontOnly) {
+        exit 0
+    }
+
+    if ($RestoreMenu) {
+        # 注意：$Restore 声明为 [string]，直接赋 $null 会被强转为空字符串，
+        # 因此先用无类型变量接返回值再判断
+        $selectedBackup = Select-BackupFromMenu
+        if ($null -eq $selectedBackup) {
+            Write-Host '已取消。'
+            exit 0
+        }
+        $Restore = $selectedBackup
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($Restore)) {
+        if (-not (Test-Path -LiteralPath $Restore -PathType Leaf)) {
+            throw ('备份文件不存在：{0}' -f $Restore)
+        }
+
+        $backup = Get-Content -LiteralPath $Restore -Raw -Encoding UTF8 | ConvertFrom-Json
+        $items = @($backup.items)
+        if ($items.Count -eq 0) {
+            throw '备份文件中没有可恢复的条目。'
+        }
+
+        Write-Host ''
+        Write-Host ('备份时间：{0}（当时改为：{1}）' -f $backup.createdAt, $backup.newAlias) -ForegroundColor Cyan
+        Write-Host ('将恢复 {0} 个注册表值：' -f $items.Count) -ForegroundColor Cyan
+        foreach ($item in $items) {
+            $oldDesc = if ($item.descriptionExists) { $item.description } else { '（原本不存在，恢复时将删除 Description）' }
+            Write-Host ('  - HKLM\{0} ({1}) → {2}' -f $item.path, $item.view, $oldDesc)
+        }
+
+        if ($DryRun) {
+            Write-Host '模拟运行完成：没有修改任何注册表值。' -ForegroundColor Green
+            exit 0
+        }
+
+        if (-not (Test-IsAdministrator)) {
+            throw '恢复注册表需要管理员权限。请以管理员身份打开 PowerShell 后重新运行。'
+        }
+
+        if (-not $NoConfirm) {
+            $confirmation = (Read-Host '是否继续恢复？请输入 Y 或 YES').Trim()
+            if ($confirmation -notmatch '^(?i:y|yes)$') {
+                Write-Host '已取消。'
+                exit 0
+            }
+        }
+
+        foreach ($item in $items) {
+            Restore-DescriptionValue ([pscustomobject]@{
+                View              = [string]$item.view
+                Path              = [string]$item.path
+                DescriptionExists = [bool]$item.descriptionExists
+                Description       = $item.description
+                DescriptionKind   = $item.descriptionKind
+            })
+            Write-Host ('已恢复 {0}：HKLM\{1}' -f $item.view, $item.path)
+        }
+
+        Write-Host ''
+        Write-Host '恢复完成。测试前请重启目标程序。' -ForegroundColor Green
+        exit 0
+    }
+
     if (-not $DryRun -and -not (Test-IsAdministrator)) {
         throw '需要管理员权限。请以管理员身份打开 PowerShell，切换到目标输入法后重新运行此脚本。'
     }
@@ -593,8 +921,15 @@ try {
         }
     }
 
-    $backupPath = Save-Backup $targetEntries $Alias
-    Write-Host ('备份文件：{0}' -f $backupPath)
+    $backupPaths = @(Save-Backup $targetEntries $Alias)
+    if ($backupPaths.Count -eq 0) {
+        Write-Host '所有目标输入法的最早备份均已存在，未创建新备份。'
+    }
+    else {
+        foreach ($savedBackup in $backupPaths) {
+            Write-Host ('备份文件：{0}' -f $savedBackup)
+        }
+    }
 
     $changedEntries = New-Object System.Collections.Generic.List[object]
     try {
