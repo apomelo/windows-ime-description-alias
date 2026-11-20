@@ -20,7 +20,11 @@ param(
     [switch]$RestoreMenu,
 
     # 仅切换当前控制台窗口字体为新宋体后退出（供 bat 启动器在显示菜单前调用）
-    [switch]$FixConsoleFontOnly
+    [switch]$FixConsoleFontOnly,
+
+    # 启动器菜单（供 bat 双击调用）：显示操作模式 + DryRun 选择，
+    # 通过退出码返回：0=退出，11=修改+DryRun，12=修改+运行，21=恢复+DryRun，22=恢复+运行
+    [switch]$LauncherMenu
 )
 
 Set-StrictMode -Version 2.0
@@ -113,6 +117,51 @@ namespace ImeAliasTool
     catch {
         # 字体切换失败不影响脚本功能
     }
+}
+
+function Show-LauncherMenu {
+    # 启动器菜单放在 ps1 而不是 bat 中：cmd 在 chcp 65001 下解析含多字节字符的
+    # 批处理行存在字节偏移 bug（部分旧版 Windows 会把一行截断执行后半截），
+    # bat 文件必须保持纯 ASCII，中文界面全部由 PowerShell 输出
+    Write-Host ''
+    Write-Host '=========================================='
+    Write-Host '  Windows 中文输入法 Description 修改工具'
+    Write-Host '=========================================='
+    Write-Host '  1. 修改输入法 Description（默认）'
+    Write-Host '  2. 从备份恢复（列出 backup 目录中的备份）'
+    Write-Host '  Q. 退出'
+    Write-Host ''
+
+    $op = ''
+    while ($true) {
+        $opInput = Read-Host '请选择 [1/2/Q]（直接回车=1）'
+        if ($null -eq $opInput) {
+            # stdin 被重定向且已读完（EOF）时 Read-Host 返回 $null，按退出处理
+            return 0
+        }
+        $op = $opInput.Trim()
+        if ($op -eq '') {
+            $op = '1'
+        }
+        if ($op -match '^(?i:q|quit)$') {
+            return 0
+        }
+        if ($op -eq '1' -or $op -eq '2') {
+            break
+        }
+        Write-Host ('无效的选择：{0}' -f $op)
+    }
+
+    Write-Host ''
+    $dryInput = Read-Host '是否以 DryRun 模拟运行（不写入注册表）？[Y/N]（直接回车=N）'
+    if ($null -eq $dryInput) {
+        $dryInput = ''
+    }
+    $dryCode = 2
+    if ($dryInput.Trim() -match '^(?i:y|yes)$') {
+        $dryCode = 1
+    }
+    return ([int]$op) * 10 + $dryCode
 }
 
 function Initialize-TsfInterop {
@@ -757,8 +806,13 @@ function Select-BackupFromMenu {
     }
     Write-Host ''
 
-    $choice = (Read-Host '请输入要恢复的备份编号，Q=取消').Trim()
-    if ($choice -match '^(?i:q|quit)$') {
+    $choiceInput = Read-Host '请输入要恢复的备份编号，Q=取消'
+    if ($null -eq $choiceInput) {
+        # stdin 被重定向且已读完（EOF）时 Read-Host 返回 $null，按取消处理
+        return $null
+    }
+    $choice = $choiceInput.Trim()
+    if ($choice -eq '' -or $choice -match '^(?i:q|quit)$') {
         return $null
     }
     $number = 0
@@ -773,6 +827,9 @@ try {
     Use-CjkConsoleFont
     if ($FixConsoleFontOnly) {
         exit 0
+    }
+    if ($LauncherMenu) {
+        exit (Show-LauncherMenu)
     }
 
     if ($RestoreMenu) {
